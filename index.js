@@ -1,80 +1,90 @@
-const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
-const youtubedl = require('yt-dlp-exec');
-const fs = require('fs');
-const readline = require('readline').createInterface({
-    input: process.stdin,
-    output: process.stdout
-});
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys')
+const youtubedl = require('yt-dlp-exec')
+const fs = require('fs')
+const pino = require('pino')
+const express = require('express')
+const app = express()
+const PORT = process.env.PORT || 3000
 
-const client = new Client({
-    authStrategy: new LocalAuth(),
-    puppeteer: { 
-        headless: true, 
-        args: ['--no-sandbox', '--disable-setuid-sandbox'] 
-    }
-});
+app.get('/', (req, res) => res.send('Cinemax Bot Online! 🔥'))
+app.listen(PORT, () => console.log('Server Started'))
 
-// QR වෙනුවට Phone Number එකෙන් Pair කරනවා
-client.on('loading_screen', (percent, message) => {
-    console.log('Loading', percent, message);
-});
+// GitHub Secret එකෙන් Session ගන්න
+async function writeSession() {
+    const SESSION_ID = process.env.SESSION_ID
+    if (!SESSION_ID) return console.log('Scan QR First')
 
-client.initialize();
+    const decoded = Buffer.from(SESSION_ID, 'base64').toString('utf-8')
+    if (!fs.existsSync('./auth')) fs.mkdirSync('./auth')
+    fs.writeFileSync('./auth/creds.json', decoded)
+}
 
-// Phone number එක ඉල්ලනවා
-readline.question('WhatsApp Number එක දාපන් මචං - Country Code එක්ක +94... : ', async (phoneNumber) => {
-    const code = await client.requestPairingCode(phoneNumber);
-    console.log(`Pairing Code එක: ${code}`);
-    console.log('WhatsApp → Linked Devices → Link with phone number → Code එක ගහපන්');
-    readline.close();
-});
+async function startBot() {
+    await writeSession()
+    const { state, saveCreds } = await useMultiFileAuthState('auth')
+    const { version } = await fetchLatestBaileysVersion()
 
-client.on('ready', () => {
-    console.log('Cinemax-english Bot වැඩ කරනවා! 🔥');
-});
+    const sock = makeWASocket({
+        version,
+        auth: state,
+        printQRInTerminal: true,
+        logger: pino({ level: 'silent' }),
+        browser: ['Cinemax Bot', 'Chrome', '1.0.0']
+    })
 
-// .dl command එක
-client.on('message', async msg => {
-    const text = msg.body;
+    sock.ev.on('creds.update', saveCreds)
 
-    if (text === '.help') {
-        msg.reply(`*Cinemax Bot* 🎬\n\n.dl <link> - Video Download\n\nEx: .dl https://youtu.be/xxx`);
-    }
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr } = update
 
-    if (text.startsWith('.dl ')) {
-        const url = text.slice(4).trim();
-        if (!url) return msg.reply('Link එකක් දාපන් මචං ❌');
-        
-        await msg.reply('Video එක බාගන්නවා... ටිකක් ඉන්න 😎');
-        
-        try {
-            const filename = `video_${Date.now()}.mp4`;
-            
-            await youtubedl(url, {
-                output: filename,
-                format: 'mp4[height<=480][filesize<15M]',
-                noPlaylist: true,
-                mergeOutputFormat: 'mp4'
-            });
+        if(qr) console.log('QR:', qr)
 
-            if (!fs.existsSync(filename)) {
-                return msg.reply('Download fail උනා මචං. Link එක Public ද?');
-            }
-
-            const stats = fs.statSync(filename);
-            if (stats.size > 16 * 1024 * 1024) {
-                 await msg.reply('File එක 16MB ට වඩා ලොකුයි මචං ❌');
-                 fs.unlinkSync(filename);
-                 return;
-            }
-
-            const media = MessageMedia.fromFilePath(filename);
-            await client.sendMessage(msg.from, media, { caption: 'Downloaded by Cinemax Bot 🎬' });
-            fs.unlinkSync(filename);
-
-        } catch (error) {
-            console.log(error);
-            await msg.reply('අවුලක් උනා මචං ❌\nPrivate/Story Video බෑ.');
+        if(connection === 'close') {
+            const shouldReconnect = lastDisconnect.error?.output?.statusCode!== DisconnectReason.loggedOut
+            if(shouldReconnect) startBot()
+        } else if(connection === 'open') {
+            console.log('Cinemax Bot වැඩ කරනවා! 🔥')
         }
-    }
-});
+    })
+
+    sock.ev.on('messages.upsert', async ({ messages }) => {
+        const msg = messages[0]
+        if(!msg.message || msg.key.fromMe) return
+
+        const text = msg.message.conversation || msg.message.extendedTextMessage?.text
+        const from = msg.key.remoteJid
+
+        if(text === '.help') {
+            await sock.sendMessage(from, { text: '*Cinemax Bot* 🎬\n\n.dl <link> - Video Download' })
+        }
+
+        if(text?.startsWith('.dl ')) {
+            const url = text.slice(4).trim()
+            if(!url) return await sock.sendMessage(from, { text: 'Link එකක් දාපන් මචං ❌' })
+
+            await sock.sendMessage(from, { text: 'Video එක බාගන්නවා... ටිකක් ඉන්න 😎' })
+
+            try {
+                const filename = `video_${Date.now()}.mp4`
+                await youtubedl(url, {
+                    output: filename,
+                    format: 'best[ext=mp4][filesize<16M]/best[filesize<16M]'
+                })
+
+                if (!fs.existsSync(filename)) {
+                    return await sock.sendMessage(from, { text: 'Download fail උනා මචං' })
+                }
+
+                await sock.sendMessage(from, {
+                    video: fs.readFileSync(filename),
+                    caption: 'Downloaded by Cinemax Bot 🎬'
+                })
+                fs.unlinkSync(filename)
+            } catch (error) {
+                await sock.sendMessage(from, { text: 'අවුලක් උනා මචං ❌' })
+            }
+        }
+    })
+}
+
+startBot()
